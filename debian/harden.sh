@@ -34,7 +34,8 @@ distro_pre_harden() {
         rkhunter chkrootkit clamav clamav-freshclam \
         auditd audispd-plugins acct sysstat \
         rsync curl ca-certificates plocate \
-        apparmor apparmor-utils apparmor-profiles
+        apparmor apparmor-utils apparmor-profiles \
+        lynis
 }
 
 distro_post_harden() {
@@ -65,14 +66,36 @@ EOF
         ok "pam_pwquality wired into common-password"
     fi
 
-    # PKGS-7370 debsums periodic verification job
+    # PKGS-7370 — debsums periodic verification. Two layers:
+    #   1) /etc/default/debsums CRON_CHECK so the debsums-shipped cron entry
+    #      actually runs (Lynis specifically checks this var)
+    #   2) our own daily wrapper that logs to syslog for Splunk pickup
     if command -v debsums >/dev/null 2>&1; then
+        if [[ -f /etc/default/debsums ]]; then
+            preserve /etc/default/debsums
+            if grep -q '^CRON_CHECK=' /etc/default/debsums; then
+                sed -i 's|^CRON_CHECK=.*|CRON_CHECK=daily|' /etc/default/debsums
+            else
+                echo 'CRON_CHECK=daily' >>/etc/default/debsums
+            fi
+        fi
         cat >/etc/cron.daily/zzz-harden-debsums <<'EOF'
 #!/bin/sh
 debsums -cs 2>&1 | logger -t debsums-check
 EOF
         chmod 750 /etc/cron.daily/zzz-harden-debsums
-        ok "daily debsums check installed"
+        ok "debsums CRON_CHECK=daily + daily check installed"
+    fi
+
+    # ACCT-9626 — sysstat ships disabled on Debian (/etc/default/sysstat).
+    # Lynis checks for ENABLED="true" specifically, and the systemd timers
+    # only collect data once enabled here.
+    if [[ -f /etc/default/sysstat ]]; then
+        preserve /etc/default/sysstat
+        sed -i 's|^ENABLED=.*|ENABLED="true"|' /etc/default/sysstat
+        grep -q '^ENABLED=' /etc/default/sysstat || echo 'ENABLED="true"' >>/etc/default/sysstat
+        systemctl enable --now sysstat sysstat-collect.timer sysstat-summary.timer 2>/dev/null || true
+        ok "sysstat enabled (ENABLED=true + timers)"
     fi
 
     # UFW default-deny + allow SSH on our port

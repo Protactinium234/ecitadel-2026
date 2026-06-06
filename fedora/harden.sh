@@ -33,7 +33,8 @@ distro_pre_harden() {
         audit psacct sysstat \
         rsync curl ca-certificates plocate \
         policycoreutils policycoreutils-python-utils setroubleshoot-server \
-        dnf-plugins-core
+        dnf-plugins-core \
+        lynis
 }
 
 distro_post_harden() {
