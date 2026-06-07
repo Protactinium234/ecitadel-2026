@@ -68,31 +68,54 @@ EOF
         ok "SELinux set to enforcing"
     fi
 
-    # firewalld: default zone drop-everything except SSH
+    # firewalld: default zone=drop, only allow what's exposed externally.
+    # Honeypot mode: external traffic hits :22 (honeypot); real sshd at
+    # 127.0.0.1:$SSH_HARDEN_PORT is loopback-only, no rule needed.
+    # No-honeypot mode: real sshd is exposed on $SSH_HARDEN_PORT.
     if systemctl is-active --quiet firewalld; then
         firewall-cmd --permanent --set-default-zone=drop >>"$HARDEN_LOG" 2>&1 || true
-        firewall-cmd --permanent --zone=drop --add-service=ssh >>"$HARDEN_LOG" 2>&1 || true
-        if [[ "$SSH_HARDEN_PORT" != "22" ]]; then
-            firewall-cmd --permanent --zone=drop --add-port="${SSH_HARDEN_PORT}/tcp" >>"$HARDEN_LOG" 2>&1 || true
-        fi
+        local ssh_external=22
+        [[ ${HONEYPOT_ENABLE:-1} == 1 ]] || ssh_external=${SSH_HARDEN_PORT}
+        firewall-cmd --permanent --zone=drop --add-port="${ssh_external}/tcp" >>"$HARDEN_LOG" 2>&1 || true
         firewall-cmd --reload >>"$HARDEN_LOG" 2>&1 || true
-        ok "firewalld default zone=drop, ssh allowed"
+        ok "firewalld default zone=drop, allow ${ssh_external}/tcp"
     fi
 
-    # Fail2ban with SSH jail
+    # Fail2ban — watch externally-exposed SSH port. With the honeypot on,
+    # add a jail for repeat rejected honeypot auth attempts as well.
     if command -v fail2ban-client >/dev/null 2>&1; then
-        mkdir -p /etc/fail2ban/jail.d
+        mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+        local ssh_external=22
+        [[ ${HONEYPOT_ENABLE:-1} == 1 ]] || ssh_external=${SSH_HARDEN_PORT}
         cat >/etc/fail2ban/jail.d/harden-ssh.local <<EOF
 [sshd]
 enabled = true
-port    = ${SSH_HARDEN_PORT}
+port    = ${ssh_external}
 backend = systemd
 maxretry = 3
-bantime = 1h
+bantime  = 1h
 findtime = 10m
 EOF
+        if [[ ${HONEYPOT_ENABLE:-1} == 1 ]]; then
+            cat >/etc/fail2ban/filter.d/ssh-honeypot.conf <<'EOF'
+[Definition]
+failregex = ^.* event='auth_attempt' ip='<HOST>' .* result='rejected'$
+ignoreregex =
+EOF
+            cat >/etc/fail2ban/jail.d/harden-ssh-honeypot.local <<EOF
+[ssh-honeypot]
+enabled  = true
+filter   = ssh-honeypot
+logpath  = /var/log/ssh-honeypot/access.log
+port     = 22
+maxretry = 5
+bantime  = 6h
+findtime = 10m
+EOF
+        fi
         systemctl enable --now fail2ban >>"$HARDEN_LOG" 2>&1 || true
-        ok "fail2ban sshd jail active"
+        systemctl restart fail2ban >>"$HARDEN_LOG" 2>&1 || true
+        ok "fail2ban active (sshd:${ssh_external}${HONEYPOT_ENABLE:+ + ssh-honeypot:22})"
     fi
 
     # Disable noisy/unsafe services flagged UNSAFE by systemd-analyze that we

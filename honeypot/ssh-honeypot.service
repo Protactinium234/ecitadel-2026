@@ -1,0 +1,45 @@
+[Unit]
+Description=SSH selective honeypot (port 22 — fakes weak pw, proxies real to backend sshd)
+Documentation=https://github.com/ — see /usr/local/sbin/ssh-honeypot
+After=network-online.target sshd.service ssh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ssh-honeypot
+Restart=on-failure
+RestartSec=5
+
+# Run as root (needs CAP_NET_BIND_SERVICE for port 22) but otherwise sandbox.
+User=root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/log/ssh-honeypot /etc/ssh-honeypot
+
+# Default config — override via /etc/default/ssh-honeypot or systemd drop-in
+Environment="HONEYPOT_PORT=22"
+Environment="REAL_SSH_HOST=127.0.0.1"
+Environment="REAL_SSH_PORT=2222"
+Environment="WEAK_PASS_FILE=/etc/ssh-honeypot/weak-passwords.txt"
+Environment="HOST_KEY_PATH=/etc/ssh-honeypot/host_rsa_key"
+Environment="LOG_DIR=/var/log/ssh-honeypot"
+EnvironmentFile=-/etc/default/ssh-honeypot
+
+[Install]
+WantedBy=multi-user.target

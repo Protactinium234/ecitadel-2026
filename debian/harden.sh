@@ -98,28 +98,58 @@ EOF
         ok "sysstat enabled (ENABLED=true + timers)"
     fi
 
-    # UFW default-deny + allow SSH on our port
+    # UFW default-deny + allow SSH on our externally-reachable port.
+    # When the honeypot is enabled, that's port 22 (honeypot) and real sshd
+    # is on 127.0.0.1:$SSH_HARDEN_PORT (no firewall rule needed). When the
+    # honeypot is off, $SSH_HARDEN_PORT is whatever sshd actually listens on.
     if command -v ufw >/dev/null 2>&1; then
         ufw --force reset >>"$HARDEN_LOG" 2>&1 || true
         ufw default deny incoming >>"$HARDEN_LOG" 2>&1
         ufw default allow outgoing >>"$HARDEN_LOG" 2>&1
-        ufw allow "${SSH_HARDEN_PORT}/tcp" comment 'ssh' >>"$HARDEN_LOG" 2>&1 || true
+        local ssh_external=22
+        [[ ${HONEYPOT_ENABLE:-1} == 1 ]] || ssh_external=${SSH_HARDEN_PORT}
+        ufw allow "${ssh_external}/tcp" comment 'ssh/honeypot' >>"$HARDEN_LOG" 2>&1 || true
         ufw --force enable >>"$HARDEN_LOG" 2>&1 || true
-        ok "ufw enabled (default deny in, allow ${SSH_HARDEN_PORT}/tcp)"
+        ok "ufw enabled (default deny in, allow ${ssh_external}/tcp)"
     fi
 
-    # Fail2ban with SSH jail
+    # Fail2ban — watch the externally-exposed SSH port (honeypot's :22, or
+    # real sshd's port if honeypot is off). The honeypot logs auth failures
+    # to /var/log/ssh-honeypot/access.log; we also add a jail for those.
     if command -v fail2ban-client >/dev/null 2>&1; then
+        local ssh_external=22
+        [[ ${HONEYPOT_ENABLE:-1} == 1 ]] || ssh_external=${SSH_HARDEN_PORT}
         cat >/etc/fail2ban/jail.d/harden-ssh.local <<EOF
 [sshd]
 enabled = true
-port    = ${SSH_HARDEN_PORT}
+port    = ${ssh_external}
 maxretry = 3
-bantime = 1h
+bantime  = 1h
 findtime = 10m
 EOF
+        if [[ ${HONEYPOT_ENABLE:-1} == 1 ]]; then
+            install -d -m 755 /etc/fail2ban/filter.d
+            cat >/etc/fail2ban/filter.d/ssh-honeypot.conf <<'EOF'
+[Definition]
+# Matches lines like:
+#   2026-06-06T18:00:00+0000 event='auth_attempt' ip='1.2.3.4' user='root' password='123456' method='password' result='rejected'
+failregex = ^.* event='auth_attempt' ip='<HOST>' .* result='rejected'$
+ignoreregex =
+EOF
+            cat >/etc/fail2ban/jail.d/harden-ssh-honeypot.local <<EOF
+[ssh-honeypot]
+enabled  = true
+filter   = ssh-honeypot
+logpath  = /var/log/ssh-honeypot/access.log
+port     = 22
+maxretry = 5
+bantime  = 6h
+findtime = 10m
+EOF
+        fi
         systemctl enable --now fail2ban >>"$HARDEN_LOG" 2>&1 || true
-        ok "fail2ban sshd jail active"
+        systemctl restart fail2ban >>"$HARDEN_LOG" 2>&1 || true
+        ok "fail2ban active (sshd:${ssh_external}${HONEYPOT_ENABLE:+ + ssh-honeypot:22})"
     fi
 
     # AppArmor — enforce all profiles
