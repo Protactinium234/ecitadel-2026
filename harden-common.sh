@@ -67,6 +67,20 @@ HONEYPOT_SRC_DIR="${LIB_DIR}/honeypot"
                    LOGG-2154 USB-3000 HRDN-7220 \
                    KRNL-6000:kernel.modules_disabled}"
 
+# Falco — runtime threat detection via eBPF. Logs to /var/log/falco/falco.json
+# in JSON format so Splunk parses it cleanly.
+: "${FALCO_ENABLE:=1}"
+: "${FALCO_OUTPUT_JSON:=/var/log/falco/falco.json}"
+
+# Wazuh agent — ships events to a Wazuh manager (separate box you run, often
+# co-located with the backup server). Agent also keeps a local ossec.log for
+# Splunk to monitor in case the manager link drops.
+: "${WAZUH_ENABLE:=1}"
+: "${WAZUH_MANAGER:=${BACKUP_SERVER}}"
+: "${WAZUH_AGENT_NAME:=$(hostname -s)}"
+: "${WAZUH_AGENT_GROUP:=ctf}"
+: "${WAZUH_REGISTRATION_PASSWORD:=}"             # optional; pass at install time
+
 # Splunk Universal Forwarder — fetched from $BACKUP_SERVER by default
 : "${SPLUNK_FWD:=1}"                       # 0 to skip entirely
 : "${SPLUNK_HOME:=/opt/splunkforwarder}"
@@ -522,6 +536,24 @@ sourcetype = ssh_honeypot_session
 [monitor:///var/log/ssh-honeypot/paramiko.log]
 disabled = false
 sourcetype = ssh_honeypot_paramiko
+
+# --- Falco (runtime threat detection, JSON) ---
+[monitor:///var/log/falco/falco.json]
+disabled = false
+sourcetype = falco:json
+
+[monitor:///var/log/falco/falco.log]
+disabled = false
+sourcetype = falco
+
+# --- Wazuh agent (local logs; alerts live on the manager) ---
+[monitor:///var/ossec/logs/ossec.log]
+disabled = false
+sourcetype = wazuh:ossec
+
+[monitor:///var/ossec/logs/active-responses.log]
+disabled = false
+sourcetype = wazuh:active_response
 
 # --- web / db / dns commonly scored in CTF ---
 [monitor:///var/log/nginx/*.log]
@@ -1471,6 +1503,149 @@ harden_rkhunter_conf() {
 }
 
 # ============================================================================
+# 6c. FALCO  (runtime threat detection, eBPF)
+# ============================================================================
+harden_falco() {
+    section "Installing Falco (runtime threat detection)"
+    if [[ ${FALCO_ENABLE} != 1 ]]; then
+        log "FALCO_ENABLE=0 — skipping"
+        return
+    fi
+
+    if [[ $DISTRO == debian ]]; then
+        if [[ ! -f /usr/share/keyrings/falco-archive-keyring.gpg ]]; then
+            curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
+                | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg 2>>"$HARDEN_LOG"
+        fi
+        cat >/etc/apt/sources.list.d/falcosecurity.list <<'EOF'
+deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main
+EOF
+        apt-get update >>"$HARDEN_LOG" 2>&1 || warn "apt update after falco repo failed"
+        # Preseed driver choice — modern eBPF (no kernel headers needed on 5.8+).
+        echo "falco falco/driver_choice select Modern eBPF" | debconf-set-selections
+        pkg_install falco
+    else
+        rpm --import https://falco.org/repo/falcosecurity-packages.asc 2>>"$HARDEN_LOG"
+        curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo https://falco.org/repo/falcosecurity-rpm.repo 2>>"$HARDEN_LOG"
+        pkg_install falco
+    fi
+
+    if ! command -v falco >/dev/null 2>&1; then
+        warn "falco not on PATH after install — skipping config"
+        return
+    fi
+
+    install -d -m 750 /var/log/falco
+    preserve /etc/falco/falco.yaml
+
+    # Enable JSON file output (for Splunk) + keep syslog (for journald visibility).
+    # Modern Falco YAML uses indented sub-keys; sed range constrains the edits
+    # to the file_output: block so we don't accidentally touch stdout_output's
+    # 'enabled: true' line elsewhere.
+    sed -i \
+        -e 's|^json_output: false$|json_output: true|' \
+        -e 's|^json_include_output_property: false$|json_include_output_property: true|' \
+        -e '/^file_output:/,/^[^ #]/ s|enabled: false|enabled: true|' \
+        -e "/^file_output:/,/^[^ #]/ s|filename:.*|filename: ${FALCO_OUTPUT_JSON}|" \
+        -e '/^syslog_output:/,/^[^ #]/ s|enabled: false|enabled: true|' \
+        /etc/falco/falco.yaml
+
+    systemctl daemon-reload
+    # Modern Falco ships three possible service units depending on driver:
+    # falco-modern-bpf (preferred), falco-bpf (legacy eBPF), falco (kmod).
+    local started=""
+    for unit in falco-modern-bpf falco-bpf falco; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${unit}\.service"; then
+            if systemctl enable --now "$unit" >>"$HARDEN_LOG" 2>&1; then
+                started=$unit
+                break
+            fi
+        fi
+    done
+    if [[ -n $started ]]; then
+        ok "falco active via ${started} → ${FALCO_OUTPUT_JSON} (+syslog)"
+    else
+        warn "no falco service unit started — check: systemctl status falco-modern-bpf"
+    fi
+}
+
+# ============================================================================
+# 6d. WAZUH AGENT  (XDR / SIEM endpoint)
+# ============================================================================
+harden_wazuh_agent() {
+    section "Installing Wazuh agent (→ manager=${WAZUH_MANAGER:-UNSET})"
+    if [[ ${WAZUH_ENABLE} != 1 ]]; then
+        log "WAZUH_ENABLE=0 — skipping"
+        return
+    fi
+    if [[ -z ${WAZUH_MANAGER} || ${WAZUH_MANAGER} == REPLACE_ME* ]]; then
+        warn "WAZUH_MANAGER not set — agent will install but won't reach a manager."
+        warn "Set WAZUH_MANAGER=<ip> and rerun, or edit /var/ossec/etc/ossec.conf after."
+    fi
+
+    if [[ $DISTRO == debian ]]; then
+        if [[ ! -f /usr/share/keyrings/wazuh.gpg ]]; then
+            curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH \
+                | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import 2>>"$HARDEN_LOG"
+            chmod 644 /usr/share/keyrings/wazuh.gpg
+        fi
+        cat >/etc/apt/sources.list.d/wazuh.list <<'EOF'
+deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main
+EOF
+        apt-get update >>"$HARDEN_LOG" 2>&1 || warn "apt update after wazuh repo failed"
+        # The Wazuh installer reads these env vars during postinst and seeds ossec.conf.
+        WAZUH_MANAGER="${WAZUH_MANAGER:-127.0.0.1}" \
+        WAZUH_AGENT_GROUP="${WAZUH_AGENT_GROUP}" \
+        WAZUH_AGENT_NAME="${WAZUH_AGENT_NAME}" \
+        WAZUH_REGISTRATION_PASSWORD="${WAZUH_REGISTRATION_PASSWORD}" \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y wazuh-agent >>"$HARDEN_LOG" 2>&1 \
+            || warn "wazuh-agent install via apt failed"
+    else
+        rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH 2>>"$HARDEN_LOG"
+        cat >/etc/yum.repos.d/wazuh.repo <<'EOF'
+[wazuh]
+gpgcheck=1
+gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
+enabled=1
+name=EL-$releasever - Wazuh
+baseurl=https://packages.wazuh.com/4.x/yum/
+protect=1
+EOF
+        WAZUH_MANAGER="${WAZUH_MANAGER:-127.0.0.1}" \
+        WAZUH_AGENT_GROUP="${WAZUH_AGENT_GROUP}" \
+        WAZUH_AGENT_NAME="${WAZUH_AGENT_NAME}" \
+        WAZUH_REGISTRATION_PASSWORD="${WAZUH_REGISTRATION_PASSWORD}" \
+        dnf -y --skip-unavailable install wazuh-agent >>"$HARDEN_LOG" 2>&1 \
+            || warn "wazuh-agent install via dnf failed"
+    fi
+
+    if [[ ! -f /var/ossec/etc/ossec.conf ]]; then
+        warn "wazuh-agent install left no /var/ossec/etc/ossec.conf — skipping config"
+        return
+    fi
+
+    # Belt-and-braces: even if the postinst env vars didn't take, force the
+    # manager address into ossec.conf so the agent has someone to talk to.
+    preserve /var/ossec/etc/ossec.conf
+    if [[ -n ${WAZUH_MANAGER} ]]; then
+        # Replace the first <address>...</address> inside the <server> block.
+        # ossec.conf can have multiple <server> blocks; we only seed the first.
+        sed -i "0,/<address>.*<\/address>/ s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|" \
+            /var/ossec/etc/ossec.conf
+    fi
+
+    systemctl daemon-reload
+    systemctl enable wazuh-agent >>"$HARDEN_LOG" 2>&1 || true
+    systemctl restart wazuh-agent >>"$HARDEN_LOG" 2>&1 || true
+    sleep 2
+    if systemctl is-active --quiet wazuh-agent; then
+        ok "wazuh-agent running (manager=${WAZUH_MANAGER:-unset}, name=${WAZUH_AGENT_NAME})"
+    else
+        warn "wazuh-agent didn't start — check: journalctl -u wazuh-agent -n 30"
+    fi
+}
+
+# ============================================================================
 # 6b. FINAL LYNIS AUDIT
 #     Installs lynis, generates a custom profile from $LYNIS_IGNORE (so the
 #     items we deliberately don't fix don't clutter the report), then runs it.
@@ -1627,6 +1802,8 @@ main() {
 
     harden_rkhunter_conf   # must run AFTER harden_ssh, BEFORE do_malware_scan
     do_malware_scan
+    harden_falco
+    harden_wazuh_agent
     do_user_audit
 
     do_lynis_audit
