@@ -81,15 +81,24 @@ HONEYPOT_SRC_DIR="${LIB_DIR}/honeypot"
 : "${WAZUH_AGENT_GROUP:=ctf}"
 : "${WAZUH_REGISTRATION_PASSWORD:=}"             # optional; pass at install time
 
-# Splunk Universal Forwarder — fetched from $BACKUP_SERVER by default
+# Splunk Universal Forwarder — indexer is our team collector by default.
+# The UF package itself can still come from BACKUP_SERVER (you stage it there).
 : "${SPLUNK_FWD:=1}"                       # 0 to skip entirely
 : "${SPLUNK_HOME:=/opt/splunkforwarder}"
-: "${SPLUNK_INDEXER:=${BACKUP_SERVER}:9997}"
+: "${SPLUNK_INDEXER:=collector.ndtsec.io:9997}"
 : "${SPLUNK_DEPLOYMENT_SERVER:=}"          # e.g. splunk-ds.ctf.local:8089; if set, supersedes outputs.conf
 : "${SPLUNK_INDEX:=main}"
 : "${SPLUNK_ADMIN_PASS:=ChangeMeAtRuntime!1}"
 : "${SPLUNK_FWD_DEB_URL:=http://${BACKUP_SERVER}/splunk/splunkforwarder.deb}"
 : "${SPLUNK_FWD_RPM_URL:=http://${BACKUP_SERVER}/splunk/splunkforwarder.rpm}"
+
+# rsyslog forwarding — ship every facility/severity to the central collector
+# alongside the Splunk UF (UF reads files; this is the live tap that catches
+# things even before they hit a file).
+: "${SYSLOG_FORWARD:=1}"
+: "${SYSLOG_FORWARD_HOST:=collector.ndtsec.io}"
+: "${SYSLOG_FORWARD_PORT:=514}"
+: "${SYSLOG_FORWARD_PROTO:=udp}"           # udp (single @) or tcp (double @@)
 
 # ============================================================================
 # LOGGING / UI
@@ -121,6 +130,15 @@ _pkg_is_installed() {
         rpm -q --quiet "$1" 2>/dev/null
     else
         dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'
+    fi
+}
+
+_refresh_metadata_after_new_repo() {
+    # dnf5 caches the per-repo metadata aggressively and an `install` right
+    # after a new .repo lands will silently miss the new packages because the
+    # metadata isn't fetched yet. apt is fine after `apt-get update` ran.
+    if [[ $DISTRO == fedora ]]; then
+        dnf -y makecache --refresh >>"$HARDEN_LOG" 2>&1 || true
     fi
 }
 
@@ -169,14 +187,23 @@ do_update() {
     if $PKG_UPDATE >>"$HARDEN_LOG" 2>&1; then
         ok "metadata refreshed"
     else
-        warn "metadata refresh failed — continuing"
+        warn "metadata refresh failed — last log lines:"
+        tail -n 8 "$HARDEN_LOG" | sed 's/^/    /' | tee -a "$HARDEN_LOG"
     fi
+    # Capture upgrade output to a temp file so we can both log it AND show the
+    # tail on failure (no more silent "see the log" warnings).
+    local upgrade_log; upgrade_log=$(mktemp)
     # shellcheck disable=SC2086
-    if $PKG_UPGRADE >>"$HARDEN_LOG" 2>&1; then
+    if $PKG_UPGRADE >"$upgrade_log" 2>&1; then
+        cat "$upgrade_log" >>"$HARDEN_LOG"
         ok "packages upgraded"
     else
-        warn "package upgrade failed — see $HARDEN_LOG; continuing"
+        cat "$upgrade_log" >>"$HARDEN_LOG"
+        warn "package upgrade failed — last 10 lines:"
+        tail -n 10 "$upgrade_log" | sed 's/^/    /' | tee -a "$HARDEN_LOG"
+        warn "(full output in $HARDEN_LOG)"
     fi
+    rm -f "$upgrade_log"
 }
 
 # ============================================================================
@@ -945,8 +972,24 @@ harden_ssh() {
     [[ -n $SSH_ALLOW_GROUPS ]] && _ssh_set AllowGroups "$SSH_ALLOW_GROUPS"
 
     if sshd -t 2>>"$HARDEN_LOG"; then
-        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
-        ok "sshd config valid + reloaded ($([[ $use_dropin == 1 ]] && echo "drop-in $target" || echo "$target"))"
+        # Debian 13 ships ssh.socket for systemd socket activation: it holds
+        # port 22 regardless of sshd_config's Port directive. When the honeypot
+        # is on, port 22 belongs to the honeypot, so the socket MUST be torn
+        # down. ssh.service then runs sshd standalone on the new (loopback) port.
+        if [[ $DISTRO == debian && $HONEYPOT_ENABLE == 1 ]] \
+           && systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.socket'; then
+            systemctl disable --now ssh.socket >>"$HARDEN_LOG" 2>&1 || true
+            systemctl enable ssh.service       >>"$HARDEN_LOG" 2>&1 || true
+        fi
+        # SIGHUP / `reload` re-reads config but doesn't always re-bind sockets
+        # cleanly when the Port has changed — full restart is required to move
+        # off the old port. `reload` is fine when only directives changed.
+        if [[ $HONEYPOT_ENABLE == 1 ]]; then
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+        else
+            systemctl reload  sshd 2>/dev/null || systemctl reload  ssh 2>/dev/null || true
+        fi
+        ok "sshd config valid + applied ($([[ $use_dropin == 1 ]] && echo "drop-in $target" || echo "$target"))"
     else
         err "sshd -t failed — see $HARDEN_LOG; reverting changes"
         if (( use_dropin )); then
@@ -970,14 +1013,24 @@ harden_ssh_honeypot() {
         return
     fi
 
-    # Dependency
-    if [[ $DISTRO == debian ]]; then
-        pkg_install python3-paramiko python3
-    else
-        pkg_install python3-paramiko python3
+    # Dependency: paramiko. Try the distro pkg first, then fall back to pip
+    # (with PEP 668 override since both Debian 13 and Fedora 43 enforce it).
+    # Fedora 43 in particular has been missing python3-paramiko in some repo
+    # snapshots — the pip path catches that case.
+    pkg_install python3 python3-paramiko
+    if ! python3 -c "import paramiko" 2>/dev/null; then
+        log "distro python3-paramiko unavailable — installing paramiko via pip"
+        pkg_install python3-pip
+        # cryptography wheel needs build tools if there's no manylinux wheel.
+        # gcc/python3-devel are usually present from earlier hardening steps.
+        if ! pip3 install --break-system-packages paramiko cryptography \
+                >>"$HARDEN_LOG" 2>&1; then
+            # Older pip (no --break-system-packages flag) — try plain.
+            pip3 install paramiko cryptography >>"$HARDEN_LOG" 2>&1 || true
+        fi
     fi
     if ! python3 -c "import paramiko" 2>/dev/null; then
-        warn "paramiko import failed — honeypot can't start"
+        warn "paramiko import still failing — honeypot can't start"
         return
     fi
 
@@ -1067,6 +1120,24 @@ EOF
 
     systemctl daemon-reload
     systemctl enable ssh-honeypot >>"$HARDEN_LOG" 2>&1 || true
+
+    # Pre-flight: who currently owns port 22? If sshd/ssh.socket is still there
+    # the honeypot won't bind and will enter a restart loop. Surface this BEFORE
+    # we trigger the restart so the user can see what's wrong.
+    if command -v ss >/dev/null 2>&1; then
+        local on22; on22=$(ss -tlnp 'sport = :22' 2>/dev/null | tail -n +2)
+        if [[ -n $on22 ]]; then
+            warn "port 22 is still bound — honeypot will fail to bind:"
+            printf '%s\n' "$on22" | tee -a "$HARDEN_LOG"
+            if printf '%s\n' "$on22" | grep -qiE '\b(sshd|systemd)\b'; then
+                warn "looks like sshd or systemd is holding it. Make sure ssh.socket is disabled and sshd is bound to ${HONEYPOT_REAL_SSH_LISTEN}:${HONEYPOT_REAL_SSH_PORT} first."
+            fi
+        fi
+    fi
+
+    # Reset the systemd failure counter — if a previous run hit "Address in use"
+    # the unit may be in a restart-rate-limited state and refuse to start.
+    systemctl reset-failed ssh-honeypot 2>/dev/null || true
 
     # Restart sshd FIRST (it should already be on the new port after harden_ssh),
     # then start the honeypot. If we start the honeypot before sshd is fully on
@@ -1527,6 +1598,7 @@ EOF
     else
         rpm --import https://falco.org/repo/falcosecurity-packages.asc 2>>"$HARDEN_LOG"
         curl -fsSL -o /etc/yum.repos.d/falcosecurity.repo https://falco.org/repo/falcosecurity-rpm.repo 2>>"$HARDEN_LOG"
+        _refresh_metadata_after_new_repo
         pkg_install falco
     fi
 
@@ -1611,6 +1683,7 @@ name=EL-$releasever - Wazuh
 baseurl=https://packages.wazuh.com/4.x/yum/
 protect=1
 EOF
+        _refresh_metadata_after_new_repo
         WAZUH_MANAGER="${WAZUH_MANAGER:-127.0.0.1}" \
         WAZUH_AGENT_GROUP="${WAZUH_AGENT_GROUP}" \
         WAZUH_AGENT_NAME="${WAZUH_AGENT_NAME}" \
@@ -1642,6 +1715,66 @@ EOF
         ok "wazuh-agent running (manager=${WAZUH_MANAGER:-unset}, name=${WAZUH_AGENT_NAME})"
     else
         warn "wazuh-agent didn't start — check: journalctl -u wazuh-agent -n 30"
+    fi
+}
+
+# ============================================================================
+# 6e. RSYSLOG FORWARD  (live log tap to central collector)
+# ============================================================================
+harden_rsyslog_forward() {
+    section "Configure rsyslog → ${SYSLOG_FORWARD_HOST}:${SYSLOG_FORWARD_PORT}/${SYSLOG_FORWARD_PROTO}"
+    if [[ ${SYSLOG_FORWARD} != 1 ]]; then
+        log "SYSLOG_FORWARD=0 — skipping"
+        return
+    fi
+    if ! command -v rsyslogd >/dev/null 2>&1; then
+        pkg_install rsyslog
+    fi
+    if ! command -v rsyslogd >/dev/null 2>&1; then
+        warn "rsyslog not available — skipping"
+        return
+    fi
+
+    # Legacy @-prefix syntax (works on rsyslog 5 → 8 → 9 on both distros).
+    # Single @ = UDP, double @@ = TCP. TCP gets a disk-assisted queue so log
+    # lines survive collector outages; UDP is fire-and-forget.
+    local prefix
+    case "${SYSLOG_FORWARD_PROTO,,}" in
+        tcp) prefix="@@" ;;
+        *)   prefix="@"  ;;
+    esac
+
+    local cfg=/etc/rsyslog.d/50-harden-forward.conf
+    if [[ $prefix == "@@" ]]; then
+        cat >"$cfg" <<EOF
+# harden-common: forward everything to central collector over TCP, with a
+# disk-assisted queue so we don't lose lines if the collector hiccups.
+\$ActionQueueType LinkedList
+\$ActionQueueFileName harden_fwd
+\$ActionQueueMaxDiskSpace 256m
+\$ActionQueueSaveOnShutdown on
+\$ActionResumeRetryCount -1
+*.* ${prefix}${SYSLOG_FORWARD_HOST}:${SYSLOG_FORWARD_PORT}
+EOF
+    else
+        cat >"$cfg" <<EOF
+# harden-common: forward everything to central collector over UDP.
+*.* ${prefix}${SYSLOG_FORWARD_HOST}:${SYSLOG_FORWARD_PORT}
+EOF
+    fi
+    chmod 644 "$cfg"
+
+    # Validate config before restarting (rsyslogd -N1 is the dry-run mode).
+    if rsyslogd -N1 -f /etc/rsyslog.conf >>"$HARDEN_LOG" 2>&1; then
+        systemctl enable rsyslog >>"$HARDEN_LOG" 2>&1 || true
+        if systemctl restart rsyslog >>"$HARDEN_LOG" 2>&1; then
+            ok "rsyslog forwarding *.* to ${prefix}${SYSLOG_FORWARD_HOST}:${SYSLOG_FORWARD_PORT}"
+        else
+            warn "rsyslog restart failed — see journalctl -u rsyslog"
+        fi
+    else
+        err "rsyslog -N1 config check failed — removing ${cfg}"
+        rm -f "$cfg"
     fi
 }
 
@@ -1804,6 +1937,7 @@ main() {
     do_malware_scan
     harden_falco
     harden_wazuh_agent
+    harden_rsyslog_forward
     do_user_audit
 
     do_lynis_audit

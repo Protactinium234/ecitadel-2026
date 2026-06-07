@@ -14,7 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export DISTRO="fedora"
 export PKG_BIN="dnf"
 export PKG_UPDATE="dnf -y makecache"
-export PKG_UPGRADE="dnf -y --skip-unavailable upgrade --refresh"
+# NOTE: --skip-unavailable is install-class only on dnf5. Passing it to
+# `upgrade` made the whole upgrade transaction error out with a non-obvious
+# argument-parsing failure on Fedora 43. Plain `dnf upgrade --refresh` works.
+export PKG_UPGRADE="dnf -y upgrade --refresh"
 # --skip-unavailable: dnf5 transactions are atomic — without this, a single
 # missing package (e.g. an old name no longer in the repos) aborts the whole
 # install and none of the listed packages land.
